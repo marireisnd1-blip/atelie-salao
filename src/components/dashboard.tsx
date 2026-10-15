@@ -501,7 +501,7 @@ export function Dashboard({
                     <p className="eyebrow">MAIS TEMPO PARA O QUE IMPORTA</p>
                     <h2>
                       Você cuida da beleza.
-                      <br />A agenda cuida do resto.
+                      <br /> A agenda cuida do resto.
                     </h2>
                     <p>
                       {demo
@@ -515,7 +515,7 @@ export function Dashboard({
                       Ver configurações <ArrowUpRight size={16} />
                     </button>
                     <span className="care-decoration" aria-hidden="true">
-                      ✳︎
+                      <Sparkles size={140} strokeWidth={1} />
                     </span>
                   </section>
                   <section className="panel team-panel">
