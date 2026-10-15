@@ -1,0 +1,134 @@
+\set ON_ERROR_STOP on
+create temp table test_results(name text not null);
+grant insert,select on test_results to authenticated,anon;
+create function pg_temp.check_true(value boolean,label text) returns void language plpgsql as $$
+begin if value is distinct from true then raise exception 'FAIL: %',label; end if; insert into test_results values(label); raise notice 'PASS: %',label; end; $$;
+create function pg_temp.expect_error(command text,expected text,label text) returns void language plpgsql as $$
+declare failed boolean := false;
+begin
+  begin execute command;
+  exception when others then
+    if position(expected in sqlerrm) = 0 and sqlstate <> expected then raise exception 'Erro inesperado em %: % (%)',label,sqlerrm,sqlstate; end if;
+    failed := true;
+  end;
+  perform pg_temp.check_true(failed,label);
+end; $$;
+insert into auth.users values('30000000-0000-4000-8000-000000000001'),('30000000-0000-4000-8000-000000000002'),('30000000-0000-4000-8000-000000000003');
+insert into team_members(id,role,professional_id) values
+('30000000-0000-4000-8000-000000000001','admin',null),
+('30000000-0000-4000-8000-000000000002','employee','10000000-0000-4000-8000-000000000001'),
+('30000000-0000-4000-8000-000000000003','employee','10000000-0000-4000-8000-000000000002');
+create temp table fixture(id text primary key,value text);
+grant select on fixture to authenticated;
+insert into fixture values('day',(select d::date::text from generate_series(current_date+2,current_date+5,interval '1 day') d where extract(dow from d) <> 0 limit 1));
+insert into fixture values('start',((select value from fixture where id = 'day') || ' 10:00:00-03'));
+insert into clients(id,phone,name) values('40000000-0000-4000-8000-000000000001','5511999999999','Cliente A'),('40000000-0000-4000-8000-000000000002','5511888888888','Cliente B');
+insert into conversations(client_id) select id from clients;
+insert into fixture values('booking',book_internal('40000000-0000-4000-8000-000000000001','20000000-0000-4000-8000-000000000001',(select value::timestamptz from fixture where id='start'))::text);
+insert into fixture values('other_booking',book_internal('40000000-0000-4000-8000-000000000002','20000000-0000-4000-8000-000000000002',(select value::timestamptz from fixture where id='start'))::text);
+select pg_temp.check_true((select count(*)=18 from working_hours),'seed repetido não duplica expediente');
+select pg_temp.expect_error(format('select book_internal(%L,%L,%L)','40000000-0000-4000-8000-000000000002','20000000-0000-4000-8000-000000000001',(select value from fixture where id='start')),'23P01','mesmo horário recusado');
+select pg_temp.expect_error(format('select book_internal(%L,%L,%L)','40000000-0000-4000-8000-000000000002','20000000-0000-4000-8000-000000000001',(select value::timestamptz+interval '30 minutes' from fixture where id='start')),'23P01','sobreposição parcial recusada');
+select pg_temp.expect_error(format('select book_internal(%L,%L,%L)','40000000-0000-4000-8000-000000000001','20000000-0000-4000-8000-000000000001',now()-interval '1 day'),'horario_passado','horário passado recusado');
+select pg_temp.expect_error(format('select book_internal(%L,%L,%L)','40000000-0000-4000-8000-000000000001','20000000-0000-4000-8000-000000000001',(select value || ' 06:00:00-03' from fixture where id='day')),'fora_do_expediente','expediente validado');
+select pg_temp.check_true(not exists(select 1 from available_slots('20000000-0000-4000-8000-000000000001',(select value::date from fixture where id='day')) where starts_at=(select value::timestamptz from fixture where id='start')),'ocupado não aparece em disponibilidade');
+select pg_temp.expect_error(format('insert into blocks(professional_id,starts_at,ends_at) values(%L,%L,%L)','10000000-0000-4000-8000-000000000001',(select value from fixture where id='start'),(select value::timestamptz+interval '1 hour' from fixture where id='start')),'bloqueio_conflita_agendamento','bloqueio não pode sobrepor agendamento');
+insert into blocks(professional_id,starts_at,ends_at) select '10000000-0000-4000-8000-000000000001',value::timestamptz+interval '3 hours',value::timestamptz+interval '4 hours' from fixture where id='start';
+select pg_temp.expect_error(format('select book_internal(%L,%L,%L)','40000000-0000-4000-8000-000000000001','20000000-0000-4000-8000-000000000001',(select value::timestamptz+interval '3 hours' from fixture where id='start')),'horario_bloqueado','folga bloqueia agendamento');
+select pg_temp.expect_error('insert into clients(phone) values(''123'')','23514','telefone inválido recusado');
+select receive_message('wamid.test1','5511999999999','Cliente A','Olá');
+select receive_message('wamid.test1','5511999999999','Cliente A','Olá novamente');
+select pg_temp.check_true((select count(*)=1 from messages where wa_message_id='wamid.test1'),'reenvio Meta não duplica mensagem');
+select pg_temp.check_true((select count(*)=1 from inbound_jobs),'reenvio Meta não duplica job');
+update salon_settings set ai_enabled=true;
+insert into fixture values('intent',prepare_intent('5511999999999','book','test-intent','20000000-0000-4000-8000-000000000003',(select value::timestamptz+interval '5 hours' from fixture where id='start'))->>'confirmacao');
+select pg_temp.expect_error(format('select confirm_intent(%L,%L)','5511888888888',(select split_part(value,' ',2) from fixture where id='intent')),'confirmacao_invalida','outro telefone não confirma proposta');
+select confirm_intent('5511999999999',(select split_part(value,' ',2) from fixture where id='intent'));
+select confirm_intent('5511999999999',(select split_part(value,' ',2) from fixture where id='intent'));
+select pg_temp.check_true((select count(*)=3 from appointments),'confirmação repetida não duplica agendamento');
+select pg_temp.expect_error(format('select prepare_intent(%L,%L,%L,null,null,%L)','5511888888888','cancel','cancel-other',(select value from fixture where id='booking')),'agendamento_nao_encontrado','cliente não cancela horário de outra');
+select pg_temp.expect_error(format('select prepare_intent(%L,%L,%L,null,%L,%L)','5511888888888','reschedule','move-other',(select value::timestamptz+interval '5 hours' from fixture where id='start'),(select value from fixture where id='booking')),'agendamento_nao_encontrado','cliente não remarca horário de outra');
+insert into fixture values('reschedule-intent',prepare_intent('5511999999999','reschedule','reschedule-own',null,(select value::timestamptz+interval '1 hour' from fixture where id='start'),(select value::uuid from fixture where id='booking'))->>'confirmacao');
+select book_internal('40000000-0000-4000-8000-000000000002','20000000-0000-4000-8000-000000000001',(select value::timestamptz+interval '1 hour' from fixture where id='start'));
+select pg_temp.expect_error(format('select confirm_intent(%L,%L)','5511999999999',(select split_part(value,' ',2) from fixture where id='reschedule-intent')),'23P01','conflito surgido após proposta impede remarcação');
+select pg_temp.check_true((select starts_at=(select value::timestamptz from fixture where id='start') from appointments where id=(select value::uuid from fixture where id='booking')),'falha na remarcação preserva horário anterior');
+insert into fixture values('cancel-intent',prepare_intent('5511999999999','cancel','cancel-own',null,null,(select value::uuid from fixture where id='booking'))->>'confirmacao');
+select confirm_intent('5511999999999',(select split_part(value,' ',2) from fixture where id='cancel-intent'));
+select pg_temp.check_true(exists(select 1 from available_slots('20000000-0000-4000-8000-000000000001',(select value::date from fixture where id='day')) where starts_at=(select value::timestamptz from fixture where id='start')),'cancelamento devolve horário livre');
+set role anon;
+select pg_temp.expect_error('select * from public.appointments','42501','anônimo sem acesso à agenda');
+select pg_temp.expect_error('select * from public.messages','42501','anônimo sem acesso a mensagens');
+reset role;
+select set_config('request.jwt.claim.sub','30000000-0000-4000-8000-000000000002',false);
+set role authenticated;
+select pg_temp.check_true((select count(*)=0 from appointments where professional_id='10000000-0000-4000-8000-000000000002'),'funcionária não lê agenda de outra');
+select pg_temp.check_true((select count(*)>0 from appointments where professional_id='10000000-0000-4000-8000-000000000001'),'funcionária lê própria agenda');
+select pg_temp.check_true((select count(*)=0 from audit_log),'auditoria invisível para funcionária');
+select pg_temp.expect_error('select set_ai(false)','acesso_negado','funcionária não altera pausa global');
+select pg_temp.expect_error('select delete_client(''40000000-0000-4000-8000-000000000001'')','acesso_negado','funcionária não apaga cliente');
+select pg_temp.expect_error('select available_slots(''20000000-0000-4000-8000-000000000001'',current_date)','42501','função backend não exposta à equipe');
+select pg_temp.expect_error('select receive_message(''fake'',''5511999999999'',''A'',''Ola'')','42501','equipe não injeta webhook');
+select pg_temp.expect_error('update team_members set role=''admin''','42501','funcionária não se promove');
+select pg_temp.expect_error(format('select staff_appointment(%L,''cancelled'')',(select value from fixture where id='other_booking')),'acesso_negado','funcionária não altera agenda de outra');
+reset role;
+select set_config('request.jwt.claim.sub','30000000-0000-4000-8000-000000000001',false);
+set role authenticated;
+select pg_temp.check_true((select count(*)>0 from audit_log),'dona lê auditoria');
+select set_ai(false);
+select pg_temp.check_true((select not ai_enabled from salon_settings),'dona pausa IA');
+select set_ai(true);
+select pg_temp.expect_error(format('select staff_appointment(%L,''completed'')',(select value from fixture where id='other_booking')),'atendimento_ainda_nao_terminou','não conclui atendimento futuro');
+reset role;
+-- Isolamento de clientes, conversas e mensagens sem vínculo com a funcionária.
+insert into clients(id,phone,name) values('40000000-0000-4000-8000-000000000003','5511777777777','Cliente exclusiva B');
+select book_internal('40000000-0000-4000-8000-000000000003','20000000-0000-4000-8000-000000000002',(select value::timestamptz+interval '2 hours' from fixture where id='start'));
+select receive_message('wamid.private','5511777777777','Cliente exclusiva B','Privado');
+select set_config('request.jwt.claim.sub','30000000-0000-4000-8000-000000000002',false);
+set role authenticated;
+select pg_temp.check_true((select count(*)=0 from clients where phone='5511777777777'),'RLS isola clientes');
+select pg_temp.check_true((select count(*)=0 from messages where wa_message_id='wamid.private'),'RLS isola mensagens');
+select pg_temp.check_true((select count(*)=0 from conversations where client_id='40000000-0000-4000-8000-000000000003'),'RLS isola conversas');
+reset role;
+select set_opt_out('5511999999999');
+select pg_temp.check_true((select not accepts_messages from clients where phone='5511999999999'),'opt-out persistido');
+update salon_settings set max_messages_hour=1;
+select receive_message('wamid.rate','5511999999999','Cliente A','Mais uma');
+select pg_temp.check_true((select j.status='done' from inbound_jobs j join messages m on m.id=j.message_id where m.wa_message_id='wamid.rate'),'rate limit não chama IA');
+select receive_message('wamid.audio','5511666666666','Áudio','[Mídia recebida: audio]',true);
+select pg_temp.check_true((select c.mode='human' from conversations c join clients cl on cl.id=c.client_id where cl.phone='5511666666666'),'áudio encaminhado para equipe');
+-- Fila e outbox: reexecução e pausa não criam respostas duplicadas.
+update salon_settings set max_messages_hour=30;
+select receive_message('wamid.queue','5511444444444','Cliente fila','Olá');
+create temp table claimed as select * from claim_job();
+select pg_temp.check_true((select count(*)=1 from claimed),'worker reivindica um job');
+select finish_job((select id from claimed),'Resposta de teste');
+select finish_job((select id from claimed),'Resposta repetida');
+select pg_temp.check_true((select count(*)=1 from messages where source_key=(select id::text from claimed)),'finalização repetida produz uma resposta');
+update salon_settings set ai_enabled=false;
+select * from claim_outbound();
+select pg_temp.check_true((select count(*)=0 from messages where send_state='queued' and origin='ai'),'pausa global cancela respostas ainda na fila');
+update salon_settings set ai_enabled=true;
+-- Esgotar leases não pode bloquear os próximos jobs para sempre.
+update inbound_jobs set status='processing',attempts=3,locked_at=now()-interval '10 minutes' where message_id=(select id from messages where wa_message_id='wamid.queue');
+select * from claim_job();
+select pg_temp.check_true((select j.status='failed' from inbound_jobs j join messages m on m.id=j.message_id where m.wa_message_id='wamid.queue'),'job interrompido sai da fila após limite de tentativas');
+select pg_temp.check_true((select c.mode='human' from conversations c join clients cl on cl.id=c.client_id where cl.phone='5511444444444'),'falha de worker encaminha atendimento para equipe');
+select receive_message('wamid.old','5511333333333','Mensagem antiga','Olá',false,now()-interval '2 days');
+select pg_temp.check_true((select j.status='done' from inbound_jobs j join messages m on m.id=j.message_id where m.wa_message_id='wamid.old'),'reentrega antiga não reabre janela de atendimento');
+update conversations set mode='human' where client_id=(select id from clients where phone='5511333333333');
+select set_config('request.jwt.claim.sub','30000000-0000-4000-8000-000000000001',false);
+set role authenticated;
+select pg_temp.expect_error(format('select enqueue_human_message(%L,''Não enviar'',''old-window'')',(select id from conversations where client_id=(select id from clients where phone='5511333333333'))),'janela_whatsapp_expirada','equipe não envia texto livre fora da janela Meta');
+reset role;
+-- Limite de reservas futuras também é validado fora da IA.
+select book_internal('40000000-0000-4000-8000-000000000002','20000000-0000-4000-8000-000000000002',(select value::timestamptz+interval '5 hours' from fixture where id='start'));
+select pg_temp.expect_error(format('select book_internal(%L,%L,%L)','40000000-0000-4000-8000-000000000002','20000000-0000-4000-8000-000000000001',(select value::timestamptz+interval '7 hours' from fixture where id='start')),'limite_agendamentos','limite de reservas futuras respeitado');
+select set_config('request.jwt.claim.sub','30000000-0000-4000-8000-000000000001',false);
+set role authenticated;
+select delete_client('40000000-0000-4000-8000-000000000001');
+reset role;
+select pg_temp.check_true(not exists(select 1 from clients where phone='5511999999999'),'LGPD remove cliente');
+select pg_temp.check_true(not exists(select 1 from messages where wa_message_id in ('wamid.test1','wamid.rate')),'LGPD remove mensagens');
+select pg_temp.check_true(not exists(select 1 from booking_intents where request_key='test-intent'),'LGPD remove propostas');
+select pg_temp.check_true(exists(select 1 from appointments where client_id is null),'LGPD preserva agenda anonimizada');
+select count(*) as assertions_passed from test_results;
